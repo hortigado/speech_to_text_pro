@@ -1,5 +1,9 @@
 # speech_to_text_pro
 
+[![pub package](https://img.shields.io/pub/v/speech_to_text_pro.svg)](https://pub.dev/packages/speech_to_text_pro)
+[![pub points](https://img.shields.io/pub/points/speech_to_text_pro?color=2E8B57&label=pub%20points)](https://pub.dev/packages/speech_to_text_pro/score)
+[![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](https://opensource.org/licenses/MIT)
+
 A production-ready, high-performance Flutter plugin for speech-to-text recognition on Android, iOS, macOS, and Web. This plugin is designed for developers who need more than just basic voice commands—it offers **Infinite Continuous Listening**, **Smart Transcription Sticking**, and **Deep Metadata** for AI-driven applications.
 
 ---
