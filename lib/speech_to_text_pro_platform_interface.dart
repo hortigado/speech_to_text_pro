@@ -31,7 +31,11 @@ abstract class SpeechToTextProPlatform extends PlatformInterface {
     throw UnimplementedError('hasPermission() has not been implemented.');
   }
 
-  Future<void> start({String localeId = 'en-US', bool continuous = false}) {
+  Future<void> start({
+    String localeId = 'en-US',
+    bool continuous = false,
+    bool onDevice = false,
+  }) {
     throw UnimplementedError('start() has not been implemented.');
   }
 
@@ -53,6 +57,12 @@ abstract class SpeechToTextProPlatform extends PlatformInterface {
 
   Future<List<String>> getLocales() {
     throw UnimplementedError('getLocales() has not been implemented.');
+  }
+
+  /// Languages usable without internet, grouped by `installed`, `pending`,
+  /// `supported` and `online`. Null when the platform cannot tell.
+  Future<Map<String, List<String>>?> getOnDeviceLocales() {
+    throw UnimplementedError('getOnDeviceLocales() has not been implemented.');
   }
 
   Stream<String> get onPartialResults {

@@ -30,8 +30,16 @@ class MethodChannelSpeechToTextPro extends SpeechToTextProPlatform {
   }
 
   @override
-  Future<void> start({String localeId = 'en-US', bool continuous = false}) async {
-    await methodChannel.invokeMethod('start', {'localeId': localeId, 'continuous': continuous});
+  Future<void> start({
+    String localeId = 'en-US',
+    bool continuous = false,
+    bool onDevice = false,
+  }) async {
+    await methodChannel.invokeMethod('start', {
+      'localeId': localeId,
+      'continuous': continuous,
+      'onDevice': onDevice,
+    });
   }
 
   @override
@@ -58,6 +66,16 @@ class MethodChannelSpeechToTextPro extends SpeechToTextProPlatform {
   Future<List<String>> getLocales() async {
     final locales = await methodChannel.invokeListMethod<String>('getLocales');
     return locales ?? [];
+  }
+
+  @override
+  Future<Map<String, List<String>>?> getOnDeviceLocales() async {
+    try {
+      final result = await methodChannel.invokeMapMethod<String, dynamic>('getOnDeviceLocales');
+      return result?.map((key, value) => MapEntry(key, (value as List).cast<String>()));
+    } on MissingPluginException {
+      return null;
+    }
   }
 
   @override

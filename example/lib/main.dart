@@ -110,6 +110,7 @@ class _SpeechExampleAppState extends State<SpeechExampleApp> with SingleTickerPr
             setState(() => _standardResult = '');
             _plugin.listen(
               localeId: _selectedLocale,
+              onDevice: true,
               onResult: (result) {
                 setState(() {
                   _standardResult = result.text;
@@ -175,7 +176,7 @@ class _SpeechExampleAppState extends State<SpeechExampleApp> with SingleTickerPr
                 _totalWords = transcript.analytics.totalWords;
               });
             });
-            _plugin.start(localeId: _selectedLocale);
+            _plugin.start(localeId: _selectedLocale, onDevice: true);
           }
         }),
       ],

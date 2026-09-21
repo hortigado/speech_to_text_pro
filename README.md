@@ -161,6 +161,19 @@ await _plugin.start(localeId: 'en-US');
 
 ---
 
+## 📴 Offline Use (No Internet)
+
+Pass `onDevice: true` to `listen()` or `start()` to recognize speech entirely on the device:
+
+```dart
+await _speech.start(localeId: 'en-US', onDevice: true);
+```
+
+The language must be available offline, otherwise an error is delivered through `onError`:
+
+- **iOS / macOS**: enable Dictation and download the language (Settings > General > Keyboard > Dictation).
+- **Android**: install the offline pack (Settings > System > Languages > Speech / Google app > Offline speech recognition). Android 13+ uses a dedicated on-device recognizer; older versions only *prefer* offline mode.
+
 ## 🎮 Session Control
 
 Regardless of which mode you use, you can control the active session using these methods:

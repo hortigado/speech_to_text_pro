@@ -56,7 +56,11 @@ class SpeechToTextProWeb extends SpeechToTextProPlatform {
   }
 
   @override
-  Future<void> start({String localeId = 'en-US', bool continuous = false}) async {
+  Future<void> start({
+    String localeId = 'en-US',
+    bool continuous = false,
+    bool onDevice = false,
+  }) async {
     _listeningController.add(true);
     // Start Web Speech API logic here
   }

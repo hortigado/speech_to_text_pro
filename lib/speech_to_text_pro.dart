@@ -229,13 +229,19 @@ class SpeechToTextPro {
 
     _resetPauseTimer(pauseFor);
 
-    return start(localeId: localeId, continuous: false);
+    return start(localeId: localeId, continuous: false, onDevice: onDevice);
   }
 
   /// PRO CONTINUOUS METHOD
   Stream<SpeechTranscript> get onTranscriptUpdate => _transcriptController.stream;
 
-  Future<void> start({String localeId = 'en-US', bool continuous = true}) async {
+  /// When [onDevice] is true, recognition runs fully offline using the
+  /// platform's on-device model (requires the language pack to be installed).
+  Future<void> start({
+    String localeId = 'en-US',
+    bool continuous = true,
+    bool onDevice = false,
+  }) async {
     _sessionFinalizedText = '';
     _sessionSegments.clear();
     _sessionStartTime = DateTime.now();
@@ -267,7 +273,11 @@ class SpeechToTextPro {
       }
     }));
 
-    return SpeechToTextProPlatform.instance.start(localeId: localeId, continuous: continuous);
+    return SpeechToTextProPlatform.instance.start(
+      localeId: localeId,
+      continuous: continuous,
+      onDevice: onDevice,
+    );
   }
 
   SpeechTranscript _createTranscript(String finalized, String partial) {
@@ -330,6 +340,13 @@ class SpeechToTextPro {
 
   Future<List<String>> getLocales() {
     return SpeechToTextProPlatform.instance.getLocales();
+  }
+
+  /// Offline language availability reported by the recognition service
+  /// (Android 13+). Null when unknown. Keys: `installed`, `pending`,
+  /// `supported`, `online`.
+  Future<Map<String, List<String>>?> getOnDeviceLocales() {
+    return SpeechToTextProPlatform.instance.getOnDeviceLocales();
   }
 
   Stream<String> get onPartialResults => SpeechToTextProPlatform.instance.onPartialResults;

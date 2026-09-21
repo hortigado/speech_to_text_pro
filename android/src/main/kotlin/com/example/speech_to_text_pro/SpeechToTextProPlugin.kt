@@ -7,10 +7,16 @@ import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.content.Context
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.speech.RecognitionListener
+import android.speech.RecognitionSupport
+import android.speech.RecognitionSupportCallback
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import androidx.annotation.NonNull
+import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -37,9 +43,25 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private var shouldBeListening = false
     private var isContinuous = false
     private var isPaused = false
+    private var onDevice = false
+    // The API 33+ on-device recognizer depends on a system service that many
+    // non-Pixel devices declare but cannot bind. Once it fails we stay on the
+    // regular recognizer (asked to prefer offline) for the rest of the process.
+    private var usingOnDeviceRecognizer = false
+    private var onDeviceRecognizerFailed = false
+    private var recognizerReady = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val onDeviceWatchdog = Runnable { fallbackToStandardRecognizer() }
+    private val unmuteRunnable = Runnable { unmuteAudio() }
     private var currentLocale = "en-US"
 
+    private val TAG = "SpeechToTextPro"
     private val RECORD_AUDIO_REQUEST_CODE = 101
+    private val ON_DEVICE_READY_TIMEOUT_MS = 4000L
+    private val SUPPORT_ERROR_GRACE_MS = 2000L
+    // The recognizer plays its end-of-listening sound while it stops, so the
+    // streams must stay muted a little longer than the stop call itself.
+    private val UNMUTE_DELAY_MS = 600L
 
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "speech_to_text_pro")
@@ -68,7 +90,8 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
             "start" -> {
                 val locale = call.argument<String>("localeId") ?: "en-US"
                 val continuous = call.argument<Boolean>("continuous") ?: false
-                startListening(locale, continuous)
+                val onDevice = call.argument<Boolean>("onDevice") ?: false
+                startListening(locale, continuous, onDevice)
                 result.success(null)
             }
             "stop" -> {
@@ -90,6 +113,9 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
             "getLocales" -> {
                 getLocales(result)
             }
+            "getOnDeviceLocales" -> {
+                getOnDeviceLocales(result)
+            }
             else -> result.notImplemented()
         }
     }
@@ -104,22 +130,81 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
         }, null, Activity.RESULT_OK, null, null)
     }
 
-    private fun startListening(locale: String, continuous: Boolean) {
+    /**
+     * Languages the recognition service reports for offline use (API 33+).
+     * Completes with null when the platform cannot answer.
+     */
+    private fun getOnDeviceLocales(result: Result) {
+        val context = activity
+        if (context == null || android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) {
+            result.success(null)
+            return
+        }
+        context.runOnUiThread { checkRecognitionSupport(context, result) }
+    }
+
+    @RequiresApi(android.os.Build.VERSION_CODES.TIRAMISU)
+    private fun checkRecognitionSupport(context: Context, result: Result) {
+        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        }
+        var replied = false
+        var lastError = 0
+        var errorReply: Runnable? = null
+
+        // The channel accepts a single reply, and some services report an error
+        // and then still deliver the result, so only the first outcome counts.
+        fun reply(block: () -> Unit) {
+            if (replied) return
+            replied = true
+            errorReply?.let { mainHandler.removeCallbacks(it) }
+            recognizer.destroy()
+            block()
+        }
+        errorReply = Runnable {
+            reply { result.error("recognition_support_error", getErrorText(lastError), lastError) }
+        }
+
+        recognizer.checkRecognitionSupport(intent, ContextCompat.getMainExecutor(context), object : RecognitionSupportCallback {
+            override fun onSupportResult(recognitionSupport: RecognitionSupport) {
+                val support = mapOf(
+                    "installed" to recognitionSupport.installedOnDeviceLanguages,
+                    "pending" to recognitionSupport.pendingOnDeviceLanguages,
+                    "supported" to recognitionSupport.supportedOnDeviceLanguages,
+                    "online" to recognitionSupport.onlineLanguages
+                )
+                Log.i(TAG, "checkRecognitionSupport: $support")
+                reply { result.success(support) }
+            }
+
+            override fun onError(error: Int) {
+                Log.w(TAG, "checkRecognitionSupport failed: ${getErrorText(error)} ($error)")
+                lastError = error
+                errorReply?.let {
+                    mainHandler.removeCallbacks(it)
+                    mainHandler.postDelayed(it, SUPPORT_ERROR_GRACE_MS)
+                }
+            }
+        })
+    }
+
+    private fun startListening(locale: String, continuous: Boolean, onDevice: Boolean) {
         currentLocale = locale
+        this.onDevice = onDevice
         shouldBeListening = true
         isContinuous = continuous
         isPaused = false
         
         if (checkPermission()) {
+            mainHandler.removeCallbacks(unmuteRunnable)
             initRecognizer()
             if (isContinuous) {
                 muteAudio()
             } else {
                 unmuteAudio() // Explicitly unmute for Standard Mode to hear native beeps
             }
-            activity?.runOnUiThread {
-                speechRecognizer?.startListening(recognizerIntent)
-            }
+            activity?.runOnUiThread { beginRecognition() }
         } else {
             requestPermission()
         }
@@ -128,8 +213,9 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private fun stopListening() {
         shouldBeListening = false
         isPaused = false
-        unmuteAudio() // Always unmute on stop to restore system sounds
+        unmuteAudioSoon() // Restore system sounds once the end-of-listening sound is over
         activity?.runOnUiThread {
+            mainHandler.removeCallbacks(onDeviceWatchdog)
             speechRecognizer?.stopListening()
             speechRecognizer?.destroy()
             speechRecognizer = null
@@ -140,8 +226,9 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private fun cancelListening() {
         shouldBeListening = false
         isPaused = false
-        unmuteAudio() // Always unmute on cancel
+        unmuteAudioSoon() // Restore system sounds once the end-of-listening sound is over
         activity?.runOnUiThread {
+            mainHandler.removeCallbacks(onDeviceWatchdog)
             speechRecognizer?.cancel()
             speechRecognizer?.destroy()
             speechRecognizer = null
@@ -160,9 +247,7 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private fun resumeListening() {
         if (shouldBeListening) {
             isPaused = false
-            activity?.runOnUiThread {
-                speechRecognizer?.startListening(recognizerIntent)
-            }
+            activity?.runOnUiThread { beginRecognition() }
         }
     }
 
@@ -181,6 +266,11 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
                 it.setStreamMute(AudioManager.STREAM_SYSTEM, true)
             }
         }
+    }
+
+    private fun unmuteAudioSoon() {
+        mainHandler.removeCallbacks(unmuteRunnable)
+        mainHandler.postDelayed(unmuteRunnable, UNMUTE_DELAY_MS)
     }
 
     private fun unmuteAudio() {
@@ -210,19 +300,32 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
         if (speechRecognizer != null) return
         
         activity?.runOnUiThread {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(activity)
+            val context = activity as Context
+            // API 33+ offers a recognizer that never touches the network.
+            usingOnDeviceRecognizer = onDevice && !onDeviceRecognizerFailed &&
+                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+            speechRecognizer = if (usingOnDeviceRecognizer) {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(context)
+            }
             speechRecognizer?.setRecognitionListener(createRecognitionListener())
             
             recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLocale)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                // Best effort on API < 33: ask the service to use its offline model.
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, onDevice)
             }
         }
     }
 
     private fun createRecognitionListener() = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
+            recognizerReady = true
+            mainHandler.removeCallbacks(onDeviceWatchdog)
             updateListeningState(true)
         }
 
@@ -242,16 +345,19 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
         }
 
         override fun onError(error: Int) {
+            if (usingOnDeviceRecognizer && !recognizerReady && isRecognizerUnavailableError(error)) {
+                fallbackToStandardRecognizer()
+                return
+            }
             val errorMessage = getErrorText(error)
             
             val shouldRestart = when (error) {
                 SpeechRecognizer.ERROR_AUDIO,
                 SpeechRecognizer.ERROR_CLIENT,
-                SpeechRecognizer.ERROR_NETWORK,
-                SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
                 SpeechRecognizer.ERROR_NO_MATCH,
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> true
+                // Network errors are not retried: restarting immediately just spins while offline.
                 else -> false
             }
 
@@ -259,6 +365,7 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
                 restartListening()
             } else {
                 updateListeningState(false)
+                unmuteAudioSoon()
                 sendEvent("error", mapOf("message" to errorMessage))
             }
         }
@@ -289,8 +396,40 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private fun restartListening() {
         activity?.runOnUiThread {
             speechRecognizer?.cancel()
-            speechRecognizer?.startListening(recognizerIntent)
+            beginRecognition()
         }
+    }
+
+    /** Must run on the UI thread. */
+    private fun beginRecognition() {
+        recognizerReady = false
+        speechRecognizer?.startListening(recognizerIntent)
+        mainHandler.removeCallbacks(onDeviceWatchdog)
+        if (usingOnDeviceRecognizer) {
+            // A failed bind of the on-device service is not always reported
+            // through onError, so give up if the mic never becomes ready.
+            mainHandler.postDelayed(onDeviceWatchdog, ON_DEVICE_READY_TIMEOUT_MS)
+        }
+    }
+
+    /** Must run on the UI thread. */
+    private fun fallbackToStandardRecognizer() {
+        mainHandler.removeCallbacks(onDeviceWatchdog)
+        if (!usingOnDeviceRecognizer || !shouldBeListening || isPaused) return
+        onDeviceRecognizerFailed = true
+        usingOnDeviceRecognizer = false
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        initRecognizer()
+        beginRecognition()
+    }
+
+    private fun isRecognizerUnavailableError(error: Int): Boolean = when (error) {
+        SpeechRecognizer.ERROR_CLIENT,
+        SpeechRecognizer.ERROR_SERVER,
+        SpeechRecognizer.ERROR_SERVER_DISCONNECTED,
+        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> true
+        else -> false
     }
 
     private fun updateListeningState(listening: Boolean) {
@@ -319,6 +458,11 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "RecognitionService busy"
             SpeechRecognizer.ERROR_SERVER -> "Error from server"
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input"
+            SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "Too many requests"
+            SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT -> "Cannot check recognition support"
+            SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> "Recognition service disconnected"
+            SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "Language not supported"
+            SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Language pack not installed for offline use"
             else -> "Unknown error"
         }
     }
@@ -339,7 +483,7 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
         if (requestCode == RECORD_AUDIO_REQUEST_CODE) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 if (shouldBeListening) {
-                    startListening(currentLocale, isContinuous)
+                    startListening(currentLocale, isContinuous, onDevice)
                 }
             } else {
                 sendEvent("error", mapOf("message" to "Permission denied"))
@@ -370,7 +514,9 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
+        mainHandler.removeCallbacks(unmuteRunnable)
         unmuteAudio()
+        mainHandler.removeCallbacks(onDeviceWatchdog)
         speechRecognizer?.destroy()
     }
 }

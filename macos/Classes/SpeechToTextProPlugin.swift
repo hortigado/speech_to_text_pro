@@ -17,6 +17,7 @@ public class SpeechToTextProPlugin: NSObject, FlutterPlugin, SFSpeechRecognizerD
   private var shouldBeListening = false
   private var isContinuous = false
   private var isPaused = false
+  private var onDevice = false
   private var currentLocale = "en-US"
 
   public static func register(with registrar: FlutterPluginRegistrar) {
@@ -43,7 +44,8 @@ public class SpeechToTextProPlugin: NSObject, FlutterPlugin, SFSpeechRecognizerD
       let args = call.arguments as? [String: Any]
       let locale = args?["localeId"] as? String ?? "en-US"
       let continuous = args?["continuous"] as? Bool ?? false
-      startListening(locale: locale, continuous: continuous)
+      let onDevice = args?["onDevice"] as? Bool ?? false
+      startListening(locale: locale, continuous: continuous, onDevice: onDevice)
       result(nil)
     case "stop":
       stopListening()
@@ -66,8 +68,9 @@ public class SpeechToTextProPlugin: NSObject, FlutterPlugin, SFSpeechRecognizerD
     }
   }
 
-  private func startListening(locale: String, continuous: Bool) {
+  private func startListening(locale: String, continuous: Bool, onDevice: Bool) {
     currentLocale = locale
+    self.onDevice = onDevice
     shouldBeListening = true
     isContinuous = continuous
     isPaused = false
@@ -92,6 +95,13 @@ public class SpeechToTextProPlugin: NSObject, FlutterPlugin, SFSpeechRecognizerD
     do {
       speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: currentLocale))
       speechRecognizer?.delegate = self
+      if onDevice {
+        guard #available(macOS 10.15, *), speechRecognizer?.supportsOnDeviceRecognition == true else {
+          sendEvent(type: "error", data: ["message": "On-device recognition is not available for \(currentLocale). Download the language for offline dictation in system settings."])
+          updateListeningState(false)
+          return
+        }
+      }
       try startAudioEngine()
       updateListeningState(true)
     } catch {
@@ -106,6 +116,9 @@ public class SpeechToTextProPlugin: NSObject, FlutterPlugin, SFSpeechRecognizerD
     recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
     guard let recognitionRequest = recognitionRequest else { return }
     recognitionRequest.shouldReportPartialResults = true
+    if #available(macOS 10.15, *) {
+      recognitionRequest.requiresOnDeviceRecognition = onDevice
+    }
 
     let inputNode = audioEngine.inputNode
     let recordingFormat = inputNode.outputFormat(forBus: 0)
