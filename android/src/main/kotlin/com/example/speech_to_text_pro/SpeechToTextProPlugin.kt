@@ -46,7 +46,8 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private var onDevice = false
     // The API 33+ on-device recognizer depends on a system service that many
     // non-Pixel devices declare but cannot bind. Once it fails we stay on the
-    // regular recognizer (asked to prefer offline) for the rest of the process.
+    // regular recognizer (asked to prefer offline), and the failure is
+    // persisted (see markOnDeviceFailed) so later launches skip the wait.
     private var usingOnDeviceRecognizer = false
     private var onDeviceRecognizerFailed = false
     private var recognizerReady = false
@@ -57,7 +58,15 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
 
     private val TAG = "SpeechToTextPro"
     private val RECORD_AUDIO_REQUEST_CODE = 101
-    private val ON_DEVICE_READY_TIMEOUT_MS = 4000L
+    // A failed bind of the on-device service is only logged by the framework
+    // ("Bind to system recognition service failed with error 10"), so this
+    // watchdog is what the user actually waits for before the mic opens.
+    private val ON_DEVICE_READY_TIMEOUT_MS = 2000L
+    private val PREFS_NAME = "speech_to_text_pro"
+    private val PREF_ON_DEVICE_FAILED_AT = "on_device_failed_at"
+    // Retry the on-device recognizer after this long in case the failure was
+    // transient (service busy, device just booted, ...).
+    private val ON_DEVICE_FAILURE_TTL_MS = 7L * 24 * 60 * 60 * 1000
     private val SUPPORT_ERROR_GRACE_MS = 2000L
     // The recognizer plays its end-of-listening sound while it stops, so the
     // streams must stay muted a little longer than the stop call itself.
@@ -302,7 +311,7 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
         activity?.runOnUiThread {
             val context = activity as Context
             // API 33+ offers a recognizer that never touches the network.
-            usingOnDeviceRecognizer = onDevice && !onDeviceRecognizerFailed &&
+            usingOnDeviceRecognizer = onDevice && !isOnDeviceKnownUnavailable() &&
                 android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
                 SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
             speechRecognizer = if (usingOnDeviceRecognizer) {
@@ -416,12 +425,27 @@ class SpeechToTextProPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, P
     private fun fallbackToStandardRecognizer() {
         mainHandler.removeCallbacks(onDeviceWatchdog)
         if (!usingOnDeviceRecognizer || !shouldBeListening || isPaused) return
-        onDeviceRecognizerFailed = true
+        markOnDeviceFailed()
         usingOnDeviceRecognizer = false
         speechRecognizer?.destroy()
         speechRecognizer = null
         initRecognizer()
         beginRecognition()
+    }
+
+    private fun isOnDeviceKnownUnavailable(): Boolean {
+        if (onDeviceRecognizerFailed) return true
+        val failedAt = activity?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ?.getLong(PREF_ON_DEVICE_FAILED_AT, 0L) ?: 0L
+        return failedAt > 0L && System.currentTimeMillis() - failedAt < ON_DEVICE_FAILURE_TTL_MS
+    }
+
+    private fun markOnDeviceFailed() {
+        onDeviceRecognizerFailed = true
+        activity?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.putLong(PREF_ON_DEVICE_FAILED_AT, System.currentTimeMillis())
+            ?.apply()
     }
 
     private fun isRecognizerUnavailableError(error: Int): Boolean = when (error) {
